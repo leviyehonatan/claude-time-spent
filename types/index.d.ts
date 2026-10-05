@@ -32,11 +32,26 @@ export type TurnRecord = {
 }
 
 
+/** The session so far, summed as each turn ends, for `/time-spent`. */
+export type Totals = {
+  turns: number
+  turnMs: number
+  /** Claude's time per phase. */
+  claude: Record<string, number>
+  /** Each tool type's time, calls and tools by name. */
+  kinds: Record<string, { ms: number; calls: number; tools: Record<string, number> }>
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'time-spent': {
-      /** Main-loop turns of this session, oldest first, the last 200. */
+      /**
+       * The working set: the running turn, the last finished one (its reply may land late)
+       * and any turn whose background tasks still run. Finished turns live in `done`.
+       */
       turns: TurnRecord[]
+      /** The session's totals. */
+      totals: Totals
       /** How the summaries are drawn. */
       mode: ViewMode
       /** Whether the cards show their lanes under the strip. */

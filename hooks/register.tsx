@@ -1,10 +1,12 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { BgTask, Phase, PhaseSeg, RunningCall, SubSpan, ToolSpan, TurnRecord, ViewMode } from '../types'
+import type { BgTask, Phase, PhaseSeg, RunningCall, SubSpan, ToolSpan, Totals, TurnRecord, ViewMode } from '../types'
 
 const turns = atom({ plugin: 'time-spent', key: 'turns' } as const, [])
 const mode = atom({ plugin: 'time-spent', key: 'mode' } as const, 'timeline' as ViewMode)
+const EMPTY_TOTALS: Totals = { turns: 0, turnMs: 0, claude: {}, kinds: {} }
+const totals = atom({ plugin: 'time-spent', key: 'totals' } as const, EMPTY_TOTALS)
 const lanesOpen = atom({ plugin: 'time-spent', key: 'lanes' } as const, true)
 const running = atom({ plugin: 'time-spent', key: 'running' } as const, {})
 const step = atom({ plugin: 'time-spent', key: 'step' } as const, null)
@@ -608,10 +610,13 @@ const cardOf = (
   columns: number,
   setView: (m: ViewMode) => () => Promise<unknown>,
   lanes: { open: boolean; toggle: () => Promise<unknown> },
+  doing = '',
 ) => {
   const { Box } = els
   const body =
-    els.Svg !== undefined && view !== 'compact'
+    view === 'timeline' || (v.isLive && view === 'bars')
+      ? nativeCard(els, v, lanes.open, doing)
+      : els.Svg !== undefined && view === 'bars'
       ? (() => {
           const c = svgCard(v, view, lanes.open)
           const Svg = els.Svg
@@ -652,7 +657,8 @@ const segsOf = (spans: readonly (Span & { color: string })[], from: number, tota
   return out.filter(g => g.w > 0)
 }
 
-const liveCard = (els: Els, v: View, doing: string, expanded: boolean) => {
+// The timeline card, live or finished, in one shape: when a turn ends the same boxes update in place.
+const nativeCard = (els: Els, v: View, expanded: boolean, doing: string) => {
   const { Box, Text } = els
   const track = (segs: Seg[]) => (
     <Box flexDirection="row" width="100%">
@@ -691,12 +697,7 @@ const liveCard = (els: Els, v: View, doing: string, expanded: boolean) => {
     const bars = v.bars.filter(b => kindOf(b.tool) === g.kind)
     const tr = tracksOf(bars)
     const tracks = Array.from({ length: tr.count }, (_, i) =>
-      segsOf(
-        bars.filter(b => tr.at.get(b) === i).map(b => ({ ...b, color: g.kind.color })),
-        v.from,
-        v.axisTotal,
-        `${g.kind.label}${i}`,
-      ),
+      segsOf(bars.filter(b => tr.at.get(b) === i).map(b => ({ ...b, color: g.kind.color })), v.from, v.axisTotal, `${g.kind.label}${i}`),
     )
     lanes.push(lane(g.kind.label, g.kind.color, g.ms, tracks, bars.some(b => b.isRunning) ? '●' : undefined))
     if (g.kind.label === 'Agents' && v.sub.length > 0) {
@@ -720,35 +721,48 @@ const liveCard = (els: Els, v: View, doing: string, expanded: boolean) => {
     lanes.push(lane(`Background ${v.bg.length}`, BG, covered(v.bg), tracks, v.bg.some(b => b.isRunning) ? '●' : undefined))
   }
   const running = v.bars.filter(b => b.isRunning).length
-  const legend = v.phaseMs.map(p => `${phaseOf(p.phase).label.toLowerCase()} ${fmt(p.ms)}`).join(' · ')
+  const legend = [
+    ...v.phaseMs.map(p => ({ label: phaseOf(p.phase).label, color: p.phase === 'waiting' ? waiting : phaseOf(p.phase).color, ms: p.ms })),
+    ...v.groups.map(g => ({ label: g.kind.label, color: g.kind.color, ms: g.ms })),
+    ...(!v.isLive && v.untrackedMs > 50 ? [{ label: 'Untracked', color: '#555555', ms: v.untrackedMs }] : []),
+  ]
+  const facts = [
+    `${v.bars.length} call${v.bars.length === 1 ? '' : 's'}`,
+    ...(running > 0 ? [`${running} running`] : []),
+    ...(v.parallelMs > 0 ? [`${fmt(v.parallelMs)} parallel`] : []),
+  ].join(' · ')
 
   return (
-    <Box flexDirection="column" gap={1} padding={1} borderStyle="round" borderColor="#2c2c2c" backgroundColor="#1c1c1c">
-      <Box flexDirection="row" justifyContent="space-between">
+    <Box key="card" flexDirection="column" gap={1} padding={1} borderStyle="round" borderColor="#2c2c2c" backgroundColor="#1c1c1c">
+      <Box key="head" flexDirection="row" justifyContent="space-between">
         <Text>
-          <Text color="#F43F5E">● </Text>
-          <Text bold>{doing}</Text>
+          <Text color={v.isLive ? '#F43F5E' : CLAUDE}>{v.isLive ? '● ' : '◷ '}</Text>
+          <Text bold>{v.isLive ? doing : fmt(v.total)}</Text>
+          {!v.isLive && <Text dimColor> this turn</Text>}
         </Text>
+        <Text dimColor>{facts}</Text>
+      </Box>
+      <Box key="body" flexDirection="column" gap={1}>
+        {expanded
+          ? lanes
+          : track(segsOf(momentsOf(v).filter(m => m.colors.length > 0).map(m => ({ start: m.start, end: m.end, color: m.colors[0] })), v.from, v.axisTotal, 'strip'))}
+      </Box>
+      <Box key="legend" flexDirection="row" flexWrap="wrap" columnGap={3}>
+        {legend.map(l => (
+          <Text key={`lg:${l.label}`}>
+            <Text color={l.color}>● </Text>
+            <Text dimColor>{l.label} </Text>
+            <Text bold>{fmt(l.ms)}</Text>
+          </Text>
+        ))}
+      </Box>
+      <Box key="foot">
         <Text dimColor>
-          {v.bars.length} call{v.bars.length === 1 ? '' : 's'}
-          {running > 0 ? ` · ${running} running` : ''}
-          {v.parallelMs > 0 ? ` · ${fmt(v.parallelMs)} parallel` : ''}
+          {v.isLive
+            ? ' '
+            : `recorded ${fmt(v.total)} · charted ${fmt(v.drawnMs)} (${Math.round((v.drawnMs / v.total) * 100)}%) · untracked ${fmt(v.untrackedMs)}`}
         </Text>
       </Box>
-      {!expanded && track(
-        segsOf(
-          momentsOf(v).filter(m => m.colors.length > 0).map(m => ({ start: m.start, end: m.end, color: m.colors[0] })),
-          v.from,
-          v.axisTotal,
-          'strip',
-        ),
-      )}
-      {expanded && (
-        <Box flexDirection="column" gap={1}>
-          {lanes}
-        </Box>
-      )}
-      {legend !== '' && <Text dimColor>Claude: {legend}</Text>}
     </Box>
   )
 }
@@ -798,6 +812,27 @@ function lanesToggle($: EngineInterface, open: boolean) {
   }
 }
 
+// What the working set keeps: the running turn, the last finished one, and turns with background work still running.
+const pruned = (list: readonly TurnRecord[]) => {
+  const lastDone = [...list].reverse().find(t => t.endedAt !== undefined)
+  return list.filter(t => t.endedAt === undefined || t === lastDone || (t.bg ?? []).some(b => b.end === undefined))
+}
+
+// Adds one finished turn to the session's totals.
+const addTotals = (sum: Totals, t: TurnRecord): Totals => {
+  const v = viewOf(t, [], null, t.endedAt ?? t.startedAt)
+  const claude = { ...sum.claude }
+  for (const p of v.phaseMs) claude[p.phase] = (claude[p.phase] ?? 0) + p.ms
+  const kinds = { ...sum.kinds }
+  for (const g of v.groups) {
+    const was = kinds[g.kind.label] ?? { ms: 0, calls: 0, tools: {} }
+    const tools = { ...was.tools }
+    for (const [name, n] of Object.entries(g.tools)) tools[name] = (tools[name] ?? 0) + n
+    kinds[g.kind.label] = { ms: was.ms + g.ms, calls: was.calls + g.calls, tools }
+  }
+  return { turns: sum.turns + 1, turnMs: sum.turnMs + v.total, claude, kinds }
+}
+
 function viewSetter($: EngineInterface) {
   return (v: ViewMode) => async () => {
     await update($, mode, () => v)
@@ -832,11 +867,16 @@ export const register: Register = on => {
     if (typeof savedLanes === 'boolean') await update($, lanesOpen, () => savedLanes)
     const all = await read($, turns)
     if (all.length === 0 || all[all.length - 1].endedAt !== undefined) await update($, liveKey, () => null)
+    // A history from before the totals existed: sum it once, then keep only the working set.
+    if ((await read($, totals)).turns === 0 && all.some(t => t.endedAt !== undefined)) {
+      await update($, totals, () => all.filter(t => t.endedAt !== undefined).reduce(addTotals, EMPTY_TOTALS))
+    }
     for (const t of await read($, turns)) {
       if (t.endedAt === undefined || t.anchor === undefined) continue
       const id = keyOf(t.anchor.head, t.anchor.length)
       if ((await read($, atom({ ...doneFamily, id }, null))) === null) await update($, atom({ ...doneFamily, id }, null), () => t)
     }
+    await update($, turns, list => pruned(list))
 
     return next(e)
   })
@@ -851,24 +891,24 @@ export const register: Register = on => {
       await $.store.set('mode', want)
       return { text: `Card view: **${want === 'off' ? 'hide' : want}**.` }
     }
-    const list = await read($, turns)
-    const spans = list.flatMap(t => t.spans)
-    const model = list.flatMap(t => t.model ?? [])
-    const turnMs = list.reduce((a, t) => a + ((t.endedAt ?? t.startedAt) - t.startedAt), 0)
-    if (list.length === 0) return { text: 'Nothing recorded yet in this chat.' }
+    const sum = await read($, totals)
+    if (sum.turns === 0) return { text: 'Nothing recorded yet in this chat.' }
+    const claudeMs = Object.values(sum.claude).reduce((x, y) => x + y, 0)
     const lines = [
-      `- **Claude**: ${fmt(covered(model))} (${PHASES.map(p => `${p.label.toLowerCase()} ${fmt(covered(model.filter(m => m.phase === p.phase)))}`).join(', ')})`,
-      ...breakdown(spans).map(g => `- **${g.kind.label}**: ${fmt(g.ms)} (${g.calls} call${g.calls === 1 ? '' : 's'}: ${Object.keys(g.tools).join(', ')})`),
+      `- **Claude**: ${fmt(claudeMs)} (${PHASES.map(p => `${p.label.toLowerCase()} ${fmt(sum.claude[p.phase] ?? 0)}`).join(', ')})`,
+      ...Object.entries(sum.kinds)
+        .sort((x, y) => y[1].ms - x[1].ms)
+        .map(([label, k]) => `- **${label}**: ${fmt(k.ms)} (${k.calls} call${k.calls === 1 ? '' : 's'}: ${Object.keys(k.tools).join(', ')})`),
     ]
 
     return {
-      text: [`**Time spent:** ${fmt(turnMs)} over ${list.length} turn${list.length === 1 ? '' : 's'}`, ...lines].join('\n'),
+      text: [`**Time spent:** ${fmt(sum.turnMs)} over ${sum.turns} turn${sum.turns === 1 ? '' : 's'}`, ...lines].join('\n'),
     }
   })
 
   on('turn.start', async ($, e, next) => {
     const now = await $.clock.now()
-    await update($, turns, list => [...list, { turnId: e.turnId, startedAt: now, spans: [], model: [], sub: [] }].slice(-200))
+    await update($, turns, list => [...pruned(list), { turnId: e.turnId, startedAt: now, spans: [], model: [], sub: [] }])
     await update($, running, () => ({}))
     await update($, subRunning, () => ({}))
     await update($, step, () => null)
@@ -889,6 +929,7 @@ export const register: Register = on => {
       const now = await $.clock.now()
       await update($, turns, list => list.map(t => (t.turnId === e.turnId ? { ...t, endedAt: now } : t)))
       const finished = (await read($, turns)).find(t => t.turnId === e.turnId)
+      if (finished !== undefined) await update($, totals, sum => addTotals(sum, finished))
       if (finished?.anchor !== undefined) {
         const id = keyOf(finished.anchor.head, finished.anchor.length)
         await update($, atom({ ...doneFamily, id }, null), () => finished)
@@ -1080,9 +1121,7 @@ export const register: Register = on => {
       return (
         <els.Box flexDirection="column" gap={1}>
           <els.Markdown text={e.props.text} />
-          {isLive
-            ? liveCard(els, v, doing, open)
-            : cardOf(els, v, view, Math.max(40, e.viewport?.columns ?? 80), viewSetter($), { open, toggle: lanesToggle($, open) })}
+          {cardOf(els, v, view, Math.max(40, e.viewport?.columns ?? 80), viewSetter($), { open, toggle: lanesToggle($, open) }, doing)}
         </els.Box>
       )
     } catch (err) {
