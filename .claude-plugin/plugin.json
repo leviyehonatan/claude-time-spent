@@ -1,0 +1,1 @@
+{ "name": "time-spent", "version": "0.7.0", "description": "A live card per turn: where the time went, across Claude and every tool type", "types": "./types/index.d.ts" }
