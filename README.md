@@ -45,3 +45,7 @@ instead: `claude --plugin-dir ~/.claude/mods/time-spent`.
 - `hooks/register.tsx`: the hooks module
 - `types/index.d.ts`: the state contract
 - `.claude-plugin/plugin.json`: the manifest
+
+## License
+
+MIT: see [LICENSE](LICENSE).
