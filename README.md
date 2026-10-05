@@ -12,6 +12,11 @@ card inline in the chat.
 - **Background tasks** (commands and agents run in the background) on the card of the
   turn that launched them, from launch to their completion notice
 - A footer that compares recorded time with what the chart accounts for
+- **Context pane** (the **context ↗** button on a card, or `/time-spent context`): the context
+  size now and over the session, the median first-token wait by context size (cached requests
+  only), and cache misses with how much they re-read
+- A quiet **ⓘ** line on a turn's card when cached requests now wait at least twice as long as
+  early in the session at 100k+ tokens, suggesting `/compact` or a new session
 - Views: `timeline`, `bars`, `compact`, `hide`; click **▾ ◷ Time spent** to fold the lanes.
   Both choices are remembered across sessions.
 
@@ -43,6 +48,7 @@ instead: `claude --plugin-dir ~/.claude/mods/time-spent`.
 ## Commands
 
 - `/time-spent`: totals for the whole session, per tool type
+- `/time-spent context`: open the Context pane
 - `/time-spent view <timeline|bars|compact|hide>`: switch the cards' view
 
 ## Files

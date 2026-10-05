@@ -29,8 +29,25 @@ export type TurnRecord = {
   bg?: BgTask[]
   /** The turn's latest text block so far: the finished card is drawn under it. */
   anchor?: { id: string; head: string; length: number }
+  /** Advice drawn under this turn's card when the session's own data supports it. */
+  nudge?: string
 }
 
+
+/** One main-loop model request: how long until its first token, and the context it carried. */
+export type StepStat = {
+  /** The turn's number in this session, from 1. */
+  turn: number
+  at: number
+  /** From sending the request to its first streamed piece. */
+  ttft: number
+  /** Tokens the request carried: uncached input, cache reads and cache writes. */
+  context: number
+  /** Tokens read fresh rather than from cache (uncached input plus cache writes). */
+  fresh: number
+  /** Most of the context was read fresh: the cache had expired or was invalidated. */
+  isMiss: boolean
+}
 
 /** The session so far, summed as each turn ends, for `/time-spent`. */
 export type Totals = {
@@ -52,6 +69,8 @@ declare module 'claude-code' {
       turns: TurnRecord[]
       /** The session's totals. */
       totals: Totals
+      /** The session's main-loop model requests, the last 500, for the Context pane. */
+      steps: StepStat[]
       /** How the summaries are drawn. */
       mode: ViewMode
       /** Whether the cards show their lanes under the strip. */

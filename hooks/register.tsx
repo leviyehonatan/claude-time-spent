@@ -1,12 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { BgTask, Phase, PhaseSeg, RunningCall, SubSpan, ToolSpan, Totals, TurnRecord, ViewMode } from '../types'
+import type { BgTask, Phase, PhaseSeg, RunningCall, StepStat, SubSpan, ToolSpan, Totals, TurnRecord, ViewMode } from '../types'
 
 const turns = atom({ plugin: 'time-spent', key: 'turns' } as const, [])
 const mode = atom({ plugin: 'time-spent', key: 'mode' } as const, 'timeline' as ViewMode)
 const EMPTY_TOTALS: Totals = { turns: 0, turnMs: 0, claude: {}, kinds: {} }
 const totals = atom({ plugin: 'time-spent', key: 'totals' } as const, EMPTY_TOTALS)
+const steps = atom({ plugin: 'time-spent', key: 'steps' } as const, [])
 const lanesOpen = atom({ plugin: 'time-spent', key: 'lanes' } as const, true)
 const running = atom({ plugin: 'time-spent', key: 'running' } as const, {})
 const step = atom({ plugin: 'time-spent', key: 'step' } as const, null)
@@ -524,7 +525,13 @@ const svgCard = (v: View, view: ViewMode, expanded: boolean) => {
 
 type Els = { Box: any; Text: any; Button: any; Svg?: any; Markdown?: any }
 
-const switcherOf = (els: Els, view: ViewMode, setView: (v: ViewMode) => () => Promise<unknown>, lanes?: { open: boolean; toggle: () => Promise<unknown> }) => {
+const switcherOf = (
+  els: Els,
+  view: ViewMode,
+  setView: (v: ViewMode) => () => Promise<unknown>,
+  lanes?: { open: boolean; toggle: () => Promise<unknown> },
+  openContext?: () => Promise<unknown>,
+) => {
   const { Box, Text, Button } = els
   const canFold = lanes !== undefined && view !== 'off' && view !== 'compact'
   return (
@@ -549,6 +556,7 @@ const switcherOf = (els: Els, view: ViewMode, setView: (v: ViewMode) => () => Pr
           />
         ))}
       </Box>
+      {openContext !== undefined && <Button key="context" label="context ↗" plain dimColor onPress={openContext} />}
     </Box>
   )
 }
@@ -612,6 +620,7 @@ const cardOf = (
   setView: (m: ViewMode) => () => Promise<unknown>,
   lanes: { open: boolean; toggle: () => Promise<unknown> },
   doing = '',
+  openContext?: () => Promise<unknown>,
 ) => {
   const { Box } = els
   const body =
@@ -627,7 +636,7 @@ const cardOf = (
 
   return (
     <Box flexDirection="column" gap={1}>
-      {switcherOf(els, view, setView, lanes)}
+      {switcherOf(els, view, setView, lanes, openContext)}
       {body}
     </Box>
   )
@@ -764,6 +773,112 @@ const nativeCard = (els: Els, v: View, expanded: boolean, doing: string) => {
             : `recorded ${fmt(v.total)} · charted ${fmt(v.drawnMs)} (${Math.round((v.drawnMs / v.total) * 100)}%) · untracked ${fmt(v.untrackedMs)}`}
         </Text>
       </Box>
+      {!v.isLive && v.turn.nudge !== undefined && (
+        <Box key="nudge">
+          <Text>
+            <Text color="#60A5FA">ⓘ </Text>
+            <Text dimColor>{v.turn.nudge}</Text>
+          </Text>
+        </Box>
+      )}
+    </Box>
+  )
+}
+
+// ---- Context: how the first-token wait relates to the context a request carries ----
+
+const CONTEXT_PANE = 'time-spent-context'
+
+const median = (xs: readonly number[]) => {
+  if (xs.length === 0) return 0
+  const s = [...xs].sort((a, b) => a - b)
+  const m = Math.floor(s.length / 2)
+  return s.length % 2 === 1 ? s[m] : (s[m - 1] + s[m]) / 2
+}
+
+const tokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`)
+
+const BUCKETS: { label: string; max: number }[] = [
+  { label: '<50k', max: 50_000 },
+  { label: '50–100k', max: 100_000 },
+  { label: '100–200k', max: 200_000 },
+  { label: '200–500k', max: 500_000 },
+  { label: '500k+', max: Number.POSITIVE_INFINITY },
+]
+
+// The advice, only when cached requests now wait at least twice as long as early in the session.
+const nudgeOf = (list: readonly StepStat[]) => {
+  const hits = list.filter(x => !x.isMiss)
+  if (hits.length < 10) return undefined
+  const early = median(hits.slice(0, 5).map(x => x.ttft))
+  const recent = median(hits.slice(-5).map(x => x.ttft))
+  const context = hits[hits.length - 1].context
+  if (early <= 0 || recent < 2 * early || recent < 2000 || context < 100_000) return undefined
+  return `First-token wait is ${(recent / early).toFixed(1)}× what it was at the start (${fmt(early)} → ${fmt(recent)} at ${tokens(context)} tokens). /compact or a new session would reset it.`
+}
+
+const contextPane = (els: Els, list: readonly StepStat[], columns: number) => {
+  const { Box, Text } = els
+  if (list.length === 0) return <Text dimColor>No model requests recorded yet in this session.</Text>
+  const last = list[list.length - 1]
+  const hits = list.filter(x => !x.isMiss)
+  const misses = list.filter(x => x.isMiss)
+  const rows = BUCKETS.map((b, i) => {
+    const lo = i === 0 ? 0 : BUCKETS[i - 1].max
+    const mine = hits.filter(x => x.context >= lo && x.context < b.max)
+    return { label: b.label, n: mine.length, ms: median(mine.map(x => x.ttft)) }
+  }).filter(r => r.n > 0)
+  const top = Math.max(1, ...rows.map(r => r.ms))
+  const barW = Math.max(8, Math.min(30, columns - 26))
+  // Context per turn: the largest request each turn carried.
+  const perTurn = new Map<number, number>()
+  for (const x of list) perTurn.set(x.turn, Math.max(perTurn.get(x.turn) ?? 0, x.context))
+  const series = [...perTurn.values()].slice(-Math.max(8, columns - 4))
+  const peak = Math.max(1, ...series)
+  const spark = series.map(v => '▁▂▃▄▅▆▇█'[Math.min(7, Math.floor((v / peak) * 7.999))]).join('')
+  const missMs = misses.reduce((a, x) => a + Math.max(0, x.ttft - median(hits.map(h => h.ttft))), 0)
+  const advice = nudgeOf(list)
+
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Text>
+        <Text bold>{tokens(last.context)} tokens now</Text>
+        <Text dimColor> · started at {tokens(list[0].context)} · {list.length} requests</Text>
+      </Text>
+      <Box flexDirection="column">
+        <Text dimColor>First-token wait by context size (cached requests, median)</Text>
+        {rows.map(r => (
+          <Text key={`b:${r.label}`}>
+            {r.label.padEnd(10)}
+            <Text color={CLAUDE}>{'█'.repeat(Math.max(1, Math.round((r.ms / top) * barW)))}</Text>
+            <Text bold> {fmt(r.ms)}</Text>
+            <Text dimColor> · {r.n}</Text>
+          </Text>
+        ))}
+      </Box>
+      <Box flexDirection="column">
+        <Text dimColor>Context over the session ({perTurn.size} turns)</Text>
+        <Text color={CLAUDE}>{spark}</Text>
+      </Box>
+      <Box flexDirection="column">
+        <Text>
+          <Text dimColor>Cache misses: </Text>
+          <Text bold>{misses.length}</Text>
+          {misses.length > 0 && <Text dimColor> (about +{fmt(missMs)} of waiting)</Text>}
+        </Text>
+        {misses.slice(-5).map(x => (
+          <Text key={`m:${x.at}`} dimColor>
+            {'  '}turn {x.turn} · re-read {tokens(x.fresh)} · waited {fmt(x.ttft)}
+          </Text>
+        ))}
+        {misses.length > 0 && <Text dimColor>  A miss follows a pause of about 5 minutes or a change early in the conversation; compacting does not prevent it.</Text>}
+      </Box>
+      {advice !== undefined && (
+        <Text>
+          <Text color="#60A5FA">ⓘ </Text>
+          {advice}
+        </Text>
+      )}
     </Box>
   )
 }
@@ -849,6 +964,10 @@ async function dropCard($: EngineInterface, id: string) {
   await update($, doneOrder, order => order.filter(k => k !== id))
 }
 
+function contextOpener($: EngineInterface) {
+  return () => $.ui.open({ id: CONTEXT_PANE, title: 'Context' })
+}
+
 function viewSetter($: EngineInterface) {
   return (v: ViewMode) => async () => {
     await update($, mode, () => v)
@@ -877,7 +996,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'time-spent',
       description: 'Time per tool type; `view <mode>` switches the cards',
-      argumentHint: '[view timeline|bars|compact|hide]',
+      argumentHint: '[context | view timeline|bars|compact|hide]',
     })
     const saved = await $.store.get('mode')
     if (isMode(saved)) await update($, mode, () => saved)
@@ -901,6 +1020,10 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'time-spent' }, async ($, e) => {
     const [verb, arg] = e.args.trim().split(/\s+/)
+    if (verb === 'context') {
+      await $.ui.open({ id: CONTEXT_PANE, title: 'Context' })
+      return { text: 'Context pane opened.' }
+    }
     if (verb === 'view') {
       const current = await read($, mode)
       const want = arg === undefined || arg === '' ? MODES[(MODES.indexOf(current) + 1) % MODES.length] : arg === 'hide' ? 'off' : arg
@@ -945,7 +1068,8 @@ export const register: Register = (on, options) => {
       ticker?.cancel()
       ticker = undefined
       const now = await $.clock.now()
-      await update($, turns, list => list.map(t => (t.turnId === e.turnId ? { ...t, endedAt: now } : t)))
+      const nudge = nudgeOf(await read($, steps))
+      await update($, turns, list => list.map(t => (t.turnId === e.turnId ? { ...t, endedAt: now, nudge } : t)))
       const finished = (await read($, turns)).find(t => t.turnId === e.turnId)
       if (finished !== undefined) await update($, totals, sum => addTotals(sum, finished))
       if (finished?.anchor !== undefined) {
@@ -975,6 +1099,7 @@ export const register: Register = (on, options) => {
       await update($, subRunning, r => ({ ...r, [subId]: { agentId, tool: '@model', start: t0 } }))
     }
     const stream = next(e)
+    let ran: { usage?: { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | null } | undefined
     try {
       for await (const chunk of stream) {
         const p = chunkPhase((chunk as { kind: string }).kind, phase)
@@ -987,13 +1112,23 @@ export const register: Register = (on, options) => {
         }
         yield chunk
       }
-      return await stream.result
+      ran = await stream.result
+      return ran
     } finally {
       const end = await $.clock.now()
       if (isMain) {
         segs.push({ phase, start: since, end })
         await update($, step, () => null)
         await onLiveTurn($, t => ({ ...t, model: [...(t.model ?? []), ...segs] }))
+        const usage = ran?.usage
+        if (usage) {
+          const fresh = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
+          const context = fresh + (usage.cache_read_input_tokens ?? 0)
+          const ttft = segs[0]?.phase === 'waiting' ? segs[0].end - segs[0].start : 0
+          const turn = (await read($, totals)).turns + 1
+          const stat: StepStat = { turn, at: t0, ttft, context, fresh, isMiss: context > 20_000 && fresh > context / 2 }
+          await update($, steps, list => [...list, stat].slice(-500))
+        }
       } else {
         const agentId = e.agentId as string
         await update($, subRunning, r => {
@@ -1096,6 +1231,12 @@ export const register: Register = (on, options) => {
     return stored
   })
 
+  on('ui.render', { component: 'Pane', requestId: CONTEXT_PANE }, async ($, e) => {
+    const els = $.ui.resolve(e) as unknown as Els
+
+    return contextPane(els, await read($, steps), Math.max(30, e.props.bodyColumns ?? 40))
+  })
+
   // Inline, under the turn's latest text block: live while the turn runs, the full card once it ends.
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     // A finished card reads its own member alone, so other turns' writes never redraw it.
@@ -1137,7 +1278,7 @@ export const register: Register = (on, options) => {
       return (
         <els.Box flexDirection="column" gap={1}>
           <els.Markdown text={e.props.text} />
-          {cardOf(els, v, view, Math.max(40, e.viewport?.columns ?? 80), viewSetter($), { open, toggle: lanesToggle($, open) }, doing)}
+          {cardOf(els, v, view, Math.max(40, e.viewport?.columns ?? 80), viewSetter($), { open, toggle: lanesToggle($, open) }, doing, contextOpener($))}
         </els.Box>
       )
     } catch (err) {
