@@ -282,7 +282,9 @@ const svgCard = (v: View, view: ViewMode, expanded: boolean) => {
   ]
   const sum = Math.max(1, ribbon.reduce((a, r) => a + r.ms, 0))
   const RW = W - 2 * P
-  if (view === 'timeline') {
+  if (expanded) {
+    // The lanes below draw the turn in order; the strip would repeat them.
+  } else if (view === 'timeline') {
     // The strip: the turn in order, each moment in the color of what ran then.
     const RH = 14
     const XR = (t: number) => P + ((t - v.from) / v.axisTotal) * RW
@@ -319,26 +321,6 @@ const svgCard = (v: View, view: ViewMode, expanded: boolean) => {
     out.push(`</g>`)
     y += 22
   }
-
-  // The legend under the ribbon: every slice with its time, as chips.
-  let cx = P
-  let cy = y + 10
-  for (const r of ribbon) {
-    const label = `${r.label} `
-    const time = fmt(r.ms)
-    const w = 14 + label.length * 6.6 + time.length * 7 + 14
-    if (cx + w > W - P) {
-      cx = P
-      cy += 18
-    }
-    const dot =
-      r.color === 'transparent'
-        ? `<circle cx="${cx + 4}" cy="${cy - 4}" r="3.5" fill="none" stroke="#8a8a8a" stroke-dasharray="1.5 1.5"/>`
-        : `<circle cx="${cx + 4}" cy="${cy - 4}" r="4" fill="${r.color}"/>`
-    out.push(`${dot}<text x="${cx + 13}" y="${cy}" class="m" font-size="11.5">${esc(r.label)}<tspan class="t n" dx="5" font-weight="600">${esc(time)}</tspan></text>`)
-    cx += w
-  }
-  y = cy + 14
 
   if (!expanded) {
     y += 2
@@ -494,6 +476,27 @@ const svgCard = (v: View, view: ViewMode, expanded: boolean) => {
     }
     y = ly + 4
   }
+
+  // The legend, under the timeline: every slice with its time, as chips.
+  let cx = P
+  let cy = y + 10
+  for (const r of ribbon) {
+    const label = `${r.label} `
+    const time = fmt(r.ms)
+    const w = 14 + label.length * 6.6 + time.length * 7 + 14
+    if (cx + w > W - P) {
+      cx = P
+      cy += 18
+    }
+    const dot =
+      r.color === 'transparent'
+        ? `<circle cx="${cx + 4}" cy="${cy - 4}" r="3.5" fill="none" stroke="#8a8a8a" stroke-dasharray="1.5 1.5"/>`
+        : `<circle cx="${cx + 4}" cy="${cy - 4}" r="4" fill="${r.color}"/>`
+    out.push(`${dot}<text x="${cx + 13}" y="${cy}" class="m" font-size="11.5">${esc(r.label)}<tspan class="t n" dx="5" font-weight="600">${esc(time)}</tspan></text>`)
+    cx += w
+  }
+  y = cy + 14
+
 
   // Footer: what was recorded against what the chart accounts for.
   out.push(`<line x1="${P}" y1="${y + 2}" x2="${W - P}" y2="${y + 2}" class="g"/>`)
@@ -732,7 +735,7 @@ const liveCard = (els: Els, v: View, doing: string, expanded: boolean) => {
           {v.parallelMs > 0 ? ` · ${fmt(v.parallelMs)} parallel` : ''}
         </Text>
       </Box>
-      {track(
+      {!expanded && track(
         segsOf(
           momentsOf(v).filter(m => m.colors.length > 0).map(m => ({ start: m.start, end: m.end, color: m.colors[0] })),
           v.from,
