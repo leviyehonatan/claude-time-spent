@@ -14,6 +14,7 @@ const tick = atom({ plugin: 'time-spent', key: 'now' } as const, 0)
 const subRunning = atom({ plugin: 'time-spent', key: 'subRunning' } as const, {})
 const liveKey = atom({ plugin: 'time-spent', key: 'liveKey' } as const, null)
 const doneFamily = { plugin: 'time-spent', key: 'done' } as const
+const doneOrder = atom({ plugin: 'time-spent', key: 'doneOrder' } as const, [])
 
 const MODES: ViewMode[] = ['timeline', 'bars', 'compact', 'off']
 const isMode = (v: unknown): v is ViewMode => MODES.includes(v as ViewMode)
@@ -833,6 +834,21 @@ const addTotals = (sum: Totals, t: TurnRecord): Totals => {
   return { turns: sum.turns + 1, turnMs: sum.turnMs + v.total, claude, kinds }
 }
 
+// Saves a finished turn's card copy and drops the oldest copies past the limit.
+async function keepCard($: EngineInterface, id: string, record: TurnRecord, limit: number) {
+  await update($, atom({ ...doneFamily, id }, null), () => record)
+  const order = [...(await read($, doneOrder)).filter(k => k !== id), id]
+  const dropped = order.length > limit ? order.slice(0, order.length - limit) : []
+  for (const old of dropped) await update($, atom({ ...doneFamily, id: old }, null), () => null)
+  await update($, doneOrder, () => order.slice(dropped.length))
+}
+
+// Removes a card copy (its reply moved it to another text block).
+async function dropCard($: EngineInterface, id: string) {
+  await update($, atom({ ...doneFamily, id }, null), () => null)
+  await update($, doneOrder, order => order.filter(k => k !== id))
+}
+
 function viewSetter($: EngineInterface) {
   return (v: ViewMode) => async () => {
     await update($, mode, () => v)
@@ -852,7 +868,9 @@ function onLiveTurn($: EngineInterface, fn: (t: TurnRecord) => TurnRecord) {
 const chunkPhase = (kind: string, was: Phase): Phase =>
   kind === 'thinking' ? 'thinking' : kind === 'text' ? 'writing' : kind === 'tool' || kind === 'input' ? 'composing' : was
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const setting = String((options as Record<string, unknown>).cardsToKeep ?? '100')
+  const limit = setting === 'all' ? Number.POSITIVE_INFINITY : Number(setting) > 0 ? Number(setting) : 100
   let ticker: { cancel: () => void } | undefined
 
   on('session.start', async ($, e, next) => {
@@ -874,7 +892,7 @@ export const register: Register = on => {
     for (const t of await read($, turns)) {
       if (t.endedAt === undefined || t.anchor === undefined) continue
       const id = keyOf(t.anchor.head, t.anchor.length)
-      if ((await read($, atom({ ...doneFamily, id }, null))) === null) await update($, atom({ ...doneFamily, id }, null), () => t)
+      if ((await read($, atom({ ...doneFamily, id }, null))) === null) await keepCard($, id, t, limit)
     }
     await update($, turns, list => pruned(list))
 
@@ -932,7 +950,7 @@ export const register: Register = on => {
       if (finished !== undefined) await update($, totals, sum => addTotals(sum, finished))
       if (finished?.anchor !== undefined) {
         const id = keyOf(finished.anchor.head, finished.anchor.length)
-        await update($, atom({ ...doneFamily, id }, null), () => finished)
+        await keepCard($, id, finished, limit)
       }
       await update($, liveKey, () => null)
       await update($, running, () => ({}))
@@ -1044,7 +1062,7 @@ export const register: Register = on => {
           const owner = (await read($, turns)).find(t => (t.bg ?? []).some(b => b.taskId === taskId))
           if (owner?.endedAt !== undefined && owner.anchor !== undefined) {
             const id = keyOf(owner.anchor.head, owner.anchor.length)
-            await update($, atom({ ...doneFamily, id }, null), () => owner)
+            if ((await read($, doneOrder)).includes(id)) await update($, atom({ ...doneFamily, id }, null), () => owner)
           }
         }
       }
@@ -1071,11 +1089,9 @@ export const register: Register = on => {
     const moved = { ...last, anchor }
     await update($, turns, l => l.map(t => (t.turnId === last.turnId ? moved : t)))
     if (last.anchor !== undefined) {
-      const oldId = keyOf(last.anchor.head, last.anchor.length)
-      await update($, atom({ ...doneFamily, id: oldId }, null), () => null)
+      await dropCard($, keyOf(last.anchor.head, last.anchor.length))
     }
-    const id = keyOf(head, length)
-    await update($, atom({ ...doneFamily, id }, null), () => moved)
+    await keepCard($, keyOf(head, length), moved, limit)
 
     return stored
   })

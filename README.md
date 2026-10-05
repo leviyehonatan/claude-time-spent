@@ -35,6 +35,11 @@ New sessions load it, including ones the desktop app starts. A running session p
 it up after a restart (in the terminal, `claude --resume`). For a single terminal session
 instead: `claude --plugin-dir ~/.claude/mods/time-spent`.
 
+## Settings
+
+- **Cards to keep** (`25`, `50`, `100`, `200`, `all`; default `100`): how many finished turns keep
+  their card in a session. Older turns show as plain messages. Change it in `/config`.
+
 ## Commands
 
 - `/time-spent`: totals for the whole session, per tool type

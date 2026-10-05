@@ -64,6 +64,8 @@ declare module 'claude-code' {
       step: { phase: Phase; since: number } | null
       /** Each finished turn, by the key of the text block its card sits under. */
       done: StateFamily<TurnRecord | null>
+      /** The keys of the cards kept in `done`, oldest first, pruned past the setting. */
+      doneOrder: string[]
       /** The key of the text block the running turn's live card sits under. */
       liveKey: string | null
       /** The clock, ticked each second while a turn runs, so the live view moves. */

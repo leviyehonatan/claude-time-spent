@@ -1,1 +1,21 @@
-{ "name": "time-spent", "version": "0.7.0", "description": "A live card per turn: where the time went, across Claude and every tool type", "types": "./types/index.d.ts" }
+{
+  "name": "time-spent",
+  "version": "0.8.0",
+  "description": "A live card per turn: where the time went, across Claude and every tool type",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "cardsToKeep": {
+      "type": "string",
+      "title": "Cards to keep",
+      "description": "How many finished turns keep their time card in a session; older turns show as plain messages.",
+      "default": "100",
+      "options": [
+        "25",
+        "50",
+        "100",
+        "200",
+        "all"
+      ]
+    }
+  }
+}
