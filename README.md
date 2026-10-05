@@ -5,14 +5,16 @@ A Claude Code mod that shows where the time in each turn went: Claude's own work
 tool type (commands, agents, edits, reads and searches, web, browser, MCP), and what
 the turn cost, as a card inline in the chat.
 
-- **Live card** under the running turn's spinner, updated every second (always in view,
-  even while the desktop app folds the turn's messages into its tool group; above the prompt
-  on surfaces with no spinner row)
+- **Live card** next to the running turn, updated every second: in the terminal under the
+  spinner; in the desktop app a one-line summary beside the spinner and the full card under the
+  turn's live tool group, which stays in view while the app folds the turn's work into it; above
+  the prompt elsewhere
 - **Finished card** under the final reply: a time strip of the turn in order, a legend
   with totals, and lanes per tool type (calls that ran together stack; parallel time is
   shaded; a subagent's own model and tool time shows on an "inside" lane)
 - **Background tasks** (commands and agents run in the background) on the card of the
-  turn that launched them, from launch to their completion notice
+  turn that launched them, from launch to their completion notice, each listed by name with
+  how long it ran and how it ended (`completed (exit code 0)`, `failed (exit code 1)`)
 - A footer that compares recorded time with what the chart accounts for
 - **Cost** of each turn: the exact total from the session's cost ledger (what `/cost` reads),
   split into Claude's own requests, agents and anything else, the cost on the Claude and

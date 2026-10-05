@@ -822,6 +822,27 @@ const nativeCard = (els: Els, v: View, expanded: boolean, doing: string) => {
       segsOf(v.bg.filter(b => tr.at.get(b) === i).map(b => ({ ...b, color: kindOf(b.tool).color })), v.from, v.axisTotal, `bg${i}`),
     )
     lanes.push(lane(`Background ${v.bg.length}`, BG, covered(v.bg), tracks, v.bg.some(b => b.isRunning) ? '●' : undefined))
+    // Each task by name, with how long it ran and how it ended: the lane alone says neither.
+    lanes.push(
+      <Box key="bg:list" flexDirection="column" paddingLeft={2}>
+        {v.bg.map((b, i) => (
+          <Text key={`bg:${i}`} wrap="truncate-end">
+            <Text color={kindOf(b.tool).color}>● </Text>
+            <Text>{shortName(b.tool)}</Text>
+            {b.detail !== undefined && <Text dimColor> · {b.detail}</Text>}
+            <Text dimColor> · {fmt(b.end - b.start)}</Text>
+            {b.isRunning ? (
+              <Text color="#F43F5E"> · running</Text>
+            ) : (
+              <Text color={/fail|error|kill/i.test(b.status ?? '') || /exit code [1-9]/.test(b.result ?? '') ? '#F43F5E' : '#34D399'}>
+                {' '}· {b.status ?? 'done'}
+                {b.result !== undefined ? ` (${b.result})` : ''}
+              </Text>
+            )}
+          </Text>
+        ))}
+      </Box>,
+    )
   }
   const running = v.bars.filter(b => b.isRunning).length
   const legend = [
@@ -1137,7 +1158,7 @@ const chunkPhase = (kind: string, was: Phase): Phase =>
   kind === 'thinking' ? 'thinking' : kind === 'text' ? 'writing' : kind === 'tool' || kind === 'input' ? 'composing' : was
 
 // The live card while a turn runs, or null when there is none to draw.
-async function liveCardOf($: EngineInterface, e: any, columns: number) {
+async function liveCardOf($: EngineInterface, e: any, columns: number, isLine = false) {
   const list = await read($, turns)
   const turn = list[list.length - 1]
   const view = await read($, mode)
@@ -1150,6 +1171,18 @@ async function liveCardOf($: EngineInterface, e: any, columns: number) {
     const v = viewOf(turn, live, phase, now, Object.values(await read($, subRunning)))
     const open = await read($, lanesOpen)
     const doing = live.length > 0 ? `Running ${[...new Set(live.map(c => shortName(c.tool)))].join(', ')}` : phase !== null ? phaseOf(phase.phase).label : 'Working'
+    if (isLine) {
+      // One line: what fits beside the desktop's spinner, which clips its row to a line.
+      return (
+        <els.Text dimColor wrap="truncate-end">
+          {'  ◷ '}
+          {fmt(v.total)}
+          {v.cost.total > 0 ? ` · ${money(v.cost.total)} so far` : ''}
+          {` · ${doing}`}
+          {v.bg.some(b => b.isRunning) ? ` · ${v.bg.filter(b => b.isRunning).length} in background` : ''}
+        </els.Text>
+      )
+    }
     return cardOf(els, v, view, Math.max(40, columns), viewSetter($), { open, toggle: lanesToggle($, open) }, doing, contextOpener($))
   } catch (err) {
     return <els.Text color="#F43F5E">time-spent: {String(err)}</els.Text>
@@ -1388,20 +1421,28 @@ export const register: Register = (on, options) => {
   on('session.append', async ($, e, next) => {
     const stored = await next(e)
     if (e.agentId === undefined && e.message.role === 'user') {
-      const raw = JSON.stringify(e.message.content ?? '')
-      const ends = [...raw.matchAll(/<task-id>([^<]+)<\/task-id>[\s\S]*?<status>([^<]+)<\/status>/g)]
+      const raw = typeof e.message.content === 'string' ? e.message.content : JSON.stringify(e.message.content ?? '').replace(/\\n/g, '\n').replace(/\\"/g, '"')
+      const tag = (block: string, name: string) => block.match(new RegExp(`<${name}>([^<]*)</${name}>`))?.[1]?.trim()
+      const ends = [...raw.matchAll(/<task-notification>([\s\S]*?)(?:<\/task-notification>|$)/g)].map(m => m[1] ?? '')
       if (ends.length > 0) {
         const now = await $.clock.now()
-        for (const [, taskId, status] of ends) {
+        for (const block of ends) {
+          const taskId = tag(block, 'task-id')
+          const toolUseId = tag(block, 'tool-use-id')
+          const status = tag(block, 'status') ?? ''
           if (!/complet|fail|kill|stop|cancel|error/i.test(status)) continue
+          // `… completed (exit code 0)` and `… failed with exit code 1` alike: keep the exit code.
+          const result = tag(block, 'summary')?.match(/exit code -?\d+/)?.[0]
+          const ms = Number(tag(block, 'duration_ms'))
+          const isIt = (b: BgTask) => b.end === undefined && ((toolUseId !== undefined && b.id === toolUseId) || (taskId !== undefined && b.taskId === taskId))
           await update($, turns, list =>
             list.map(t =>
-              (t.bg ?? []).some(b => b.taskId === taskId && b.end === undefined)
-                ? { ...t, bg: (t.bg ?? []).map(b => (b.taskId === taskId && b.end === undefined ? { ...b, end: now, status } : b)) }
+              (t.bg ?? []).some(isIt)
+                ? { ...t, bg: (t.bg ?? []).map(b => (isIt(b) ? { ...b, end: ms > 0 ? Math.min(now, b.start + ms) : now, status, result, taskId: b.taskId ?? taskId } : b)) }
                 : t,
             ),
           )
-          const owner = (await read($, turns)).find(t => (t.bg ?? []).some(b => b.taskId === taskId))
+          const owner = (await read($, turns)).find(t => (t.bg ?? []).some(b => b.id === toolUseId || (taskId !== undefined && b.taskId === taskId)))
           if (owner?.endedAt !== undefined && owner.anchor !== undefined) {
             const id = keyOf(owner.anchor.head, owner.anchor.length)
             if ((await read($, doneOrder)).includes(id)) await update($, atom({ ...doneFamily, id }, null), () => owner)
@@ -1452,22 +1493,43 @@ export const register: Register = (on, options) => {
     return contextPane(els, await read($, steps), Math.max(30, e.props.bodyColumns ?? 40), sum, spent, live)
   })
 
-  // The live card draws under the running turn's spinner row: next to the work, and never folded
-  // into the turn's tool group the way the latest text block is.
+  // The live card draws under the running turn's spinner row in the terminal: next to the work, and
+  // never folded into the turn's tool group. The desktop clips that row to one line, so it gets the
+  // card's one-line summary there and the full card under the live tool group.
   on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
-    const card = await liveCardOf($, e, (e.viewport?.columns ?? 80) - 4)
+    const isLine = e.surface !== 'terminal'
+    const card = await liveCardOf($, e, (e.viewport?.columns ?? 80) - 4, isLine)
     const row = await next(e)
     if (card === null) return row
     const { Box } = $.ui.resolve(e) as unknown as Els
     return (
-      <Box flexDirection="column">
+      <Box flexDirection={isLine ? 'row' : 'column'}>
         {row}
         {card}
       </Box>
     )
   })
 
-  // Surfaces that draw no spinner row keep the live card above the prompt.
+  // Elsewhere the full live card draws under the turn's live tool group: its header is the row the
+  // desktop folds the turn's work into, so it stays in view, just above the spinner.
+  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
+    const row = await next(e)
+    if (e.surface === 'terminal' || !e.props.isActive) return row
+    // The desktop draws an empty live group (no calls yet, "Thinking") one line tall: the summary fits
+    // there, the card once the group holds calls and gets its full height.
+    const isLine = e.props.calls.length === 0
+    const card = await liveCardOf($, e, (e.viewport?.columns ?? 80) - 4, isLine)
+    if (card === null) return row
+    const { Box } = $.ui.resolve(e) as unknown as Els
+    return (
+      <Box flexDirection={isLine ? 'row' : 'column'} gap={isLine ? 0 : 1}>
+        {row}
+        {card}
+      </Box>
+    )
+  })
+
+  // Surfaces with neither a spinner row nor tool groups to hold it keep the card above the prompt.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey || e.surface === 'terminal' || e.surface === 'desktop') return next(e)
     const card = await liveCardOf($, e, e.props.bodyColumns)

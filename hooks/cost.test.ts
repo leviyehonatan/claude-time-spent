@@ -61,3 +61,18 @@ test('the live card draws under the spinner row while the turn runs', async ($: 
     expect(drawn).toContain('Working')
   }
 })
+
+test('on the desktop the full live card draws under the live tool group', async ($: any, on: any) => {
+  engine(on)
+  on('ui.render', { component: 'ToolGroup' }, async ($: any, e: any) => {
+    const { Text } = $.ui.resolve(e)
+    return h(Text, null, 'Ran 2 commands')
+  })
+  await turn($)
+  const group = (isActive: boolean) => ({ calls: [], isActive, isExpanded: false })
+  const live = JSON.stringify(await (await $.ui.mount({ plugin: 'time-spent', surface: 'desktop', component: 'ToolGroup', props: group(true) })).drawn())
+  expect(live).toContain('Ran 2 commands')
+  expect(live).toContain(PRICE)
+  const old = JSON.stringify(await (await $.ui.mount({ plugin: 'time-spent', surface: 'desktop', component: 'ToolGroup', props: group(false) })).drawn())
+  expect(old).not.toContain(PRICE)
+})

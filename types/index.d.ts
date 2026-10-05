@@ -29,7 +29,8 @@ export type Req = {
 }
 
 /** A command or agent launched in the background: from launch until its completion notice. */
-export type BgTask = { id: string; tool: string; start: number; end?: number; detail?: string; taskId?: string; status?: string }
+/** `id` is the launching call's tool_use_id; `result` what its notification said beyond the status (`exit code 0`). */
+export type BgTask = { id: string; tool: string; start: number; end?: number; detail?: string; taskId?: string; status?: string; result?: string }
 
 export type TurnRecord = {
   turnId: string
