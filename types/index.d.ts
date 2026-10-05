@@ -11,7 +11,22 @@ export type Phase = 'waiting' | 'thinking' | 'writing' | 'composing'
 export type PhaseSeg = { phase: Phase; start: number; end: number }
 
 /** A subagent's own work: a model request (`tool: '@model'`) or one of its tool calls. */
-export type SubSpan = { agentId: string; tool: string; start: number; end: number }
+export type SubSpan = { agentId: string; tool: string; start: number; end: number; usd?: number }
+
+/** One main-loop model request and what it cost at list price. */
+export type Req = {
+  start: number
+  end: number
+  model: string
+  /** Estimated from the token counts and the model's list price. */
+  usd: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  /** The tool results this request was the first to read, e.g. `Read ×2, Bash`. */
+  after?: string
+}
 
 /** A command or agent launched in the background: from launch until its completion notice. */
 export type BgTask = { id: string; tool: string; start: number; end?: number; detail?: string; taskId?: string; status?: string }
@@ -31,6 +46,14 @@ export type TurnRecord = {
   anchor?: { id: string; head: string; length: number }
   /** Advice drawn under this turn's card when the session's own data supports it. */
   nudge?: string
+  /** The main loop's model requests, priced. */
+  reqs?: Req[]
+  /** The session cost ledger (what `/cost` totals) when the turn started. */
+  usdStart?: number
+  /** The ledger's growth over the turn: its exact cost. */
+  usd?: number
+  /** The account is on a subscription: the dollars are API list-price equivalents. */
+  isSub?: boolean
 }
 
 
@@ -47,12 +70,20 @@ export type StepStat = {
   fresh: number
   /** Most of the context was read fresh: the cache had expired or was invalidated. */
   isMiss: boolean
+  /** What the request cost at list price. */
+  usd?: number
+  /** On a miss: what it cost over the same request read from cache. */
+  missUsd?: number
 }
 
 /** The session so far, summed as each turn ends, for `/time-spent`. */
 export type Totals = {
   turns: number
   turnMs: number
+  /** Dollars over the finished turns (ledger growth). */
+  usd?: number
+  /** Turn costs in order, the last 200, for the Context pane. */
+  turnUsd?: number[]
   /** Claude's time per phase. */
   claude: Record<string, number>
   /** Each tool type's time, calls and tools by name. */

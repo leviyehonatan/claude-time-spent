@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { BgTask, Phase, PhaseSeg, RunningCall, StepStat, SubSpan, ToolSpan, Totals, TurnRecord, ViewMode } from '../types'
+import type { BgTask, Phase, PhaseSeg, Req, RunningCall, StepStat, SubSpan, ToolSpan, Totals, TurnRecord, ViewMode } from '../types'
 
 const turns = atom({ plugin: 'time-spent', key: 'turns' } as const, [])
 const mode = atom({ plugin: 'time-spent', key: 'mode' } as const, 'timeline' as ViewMode)
@@ -61,6 +61,92 @@ const fmt = (ms: number) => {
 
 type Span = { start: number; end: number }
 
+const tokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`)
+
+// ---- Money: list prices in dollars per million tokens ----
+
+type Price = { in: number; out: number; read: number; write: number }
+
+const OPUS: Price = { in: 4, out: 20, read: 0.2, write: 5 }
+
+// First match wins, so a newer model sits above the family default. `write` is the 5-minute cache write.
+const PRICES: [RegExp, Price][] = [
+  [/fable|mythos/, { in: 10, out: 50, read: 0.25, write: 12.5 }],
+  [/opus-5-5/, OPUS],
+  [/opus-(5|4-[5-9])/, { in: 5, out: 25, read: 0.5, write: 6.25 }],
+  [/opus/, { in: 15, out: 75, read: 1.5, write: 18.75 }],
+  [/sonnet-5/, { in: 2, out: 10, read: 0.2, write: 2.5 }],
+  [/sonnet/, { in: 3, out: 15, read: 0.3, write: 3.75 }],
+  [/haiku-3/, { in: 0.8, out: 4, read: 0.08, write: 1 }],
+  [/haiku/, { in: 1, out: 5, read: 0.1, write: 1.25 }],
+]
+
+// An unknown model is priced as the current Opus.
+const priceOf = (model: string) => PRICES.find(([re]) => re.test(model))?.[1] ?? OPUS
+
+type Usage = { model?: string; input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
+
+const usdOf = (u: Usage) => {
+  const p = priceOf(u.model ?? '')
+  return ((u.input_tokens ?? 0) * p.in + (u.output_tokens ?? 0) * p.out + (u.cache_read_input_tokens ?? 0) * p.read + (u.cache_creation_input_tokens ?? 0) * p.write) / 1e6
+}
+
+// What a request that missed the cache paid over the same request read from cache.
+const missUsdOf = (u: Usage) => {
+  const p = priceOf(u.model ?? '')
+  return ((u.input_tokens ?? 0) * (p.in - p.read) + (u.cache_creation_input_tokens ?? 0) * (p.write - p.read)) / 1e6
+}
+
+const money = (usd: number) => (usd < 0.005 ? '<$0.01' : usd < 100 ? `$${usd.toFixed(2)}` : `$${Math.round(usd)}`)
+
+const sumUsd = (xs: readonly { usd?: number }[]) => xs.reduce((a, x) => a + (x.usd ?? 0), 0)
+
+type Cost = {
+  /** The ledger's figure once the turn ended, else the sum of the estimates. */
+  total: number
+  isExact: boolean
+  isSub: boolean
+  claude: number
+  agents: number
+  /** Ledger cost no recorded request accounts for (side calls, compaction, price drift). */
+  other: number
+  reqs: (Req & { usd: number })[]
+}
+
+// The estimates are scaled (within ±25%) to add up to the ledger, which /cost reads; past that the rest shows as "other".
+const costOf = (turn: TurnRecord, sub: readonly SubSpan[]): Cost => {
+  const claude = sumUsd(turn.reqs ?? [])
+  const agents = sumUsd(sub)
+  const est = claude + agents
+  const isExact = turn.usd !== undefined
+  const k = isExact && est > 0 ? Math.min(1.25, Math.max(0.8, (turn.usd as number) / est)) : 1
+  const other = isExact ? (turn.usd as number) - est * k : 0
+  return {
+    total: isExact ? (turn.usd as number) : est,
+    isExact,
+    isSub: turn.isSub === true,
+    claude: claude * k,
+    agents: agents * k,
+    other: Math.abs(other) >= 0.01 ? other : 0,
+    reqs: (turn.reqs ?? []).map(r => ({ ...r, usd: r.usd * k })),
+  }
+}
+
+const costLine = (c: Cost) =>
+  [
+    `${money(c.total)}${c.isExact ? '' : ' so far'}`,
+    `Claude ${money(c.claude)}${c.reqs.length > 0 ? ` (${c.reqs.length} request${c.reqs.length === 1 ? '' : 's'})` : ''}`,
+    ...(c.agents > 0 ? [`agents ${money(c.agents)}`] : []),
+    ...(c.other !== 0 ? [`other ${money(c.other)}`] : []),
+  ].join(' · ') + (c.isSub ? ' · API list price' : '')
+
+// The requests that cost the most, with the tool results each was the first to read.
+const priciest = (c: Cost, n = 3) =>
+  [...c.reqs]
+    .sort((a, b) => b.usd - a.usd)
+    .slice(0, n)
+    .map(r => `${money(r.usd)}${r.after ? ` after ${r.after}` : ''} (${tokens(r.input + r.cacheWrite)} fresh, ${tokens(r.output)} out)`)
+
 const unionOf = (spans: readonly Span[]) => {
   const out: [number, number][] = []
   for (const b of [...spans].sort((x, y) => x.start - y.start)) {
@@ -92,7 +178,7 @@ const parallelIntervals = (spans: readonly Span[]) => {
   return out
 }
 
-const shortName = (tool: string) => (tool.startsWith('mcp__') ? tool.split('__').slice(-1)[0] : tool)
+const shortName = (tool: string) => (tool.startsWith('mcp__') ? (tool.split('__').slice(-1)[0] ?? tool) : tool)
 
 type Group = { kind: Kind; ms: number; calls: number; tools: Record<string, number> }
 
@@ -140,6 +226,7 @@ type View = {
   /** The drawn axis: the turn, stretched to the last background task's end. */
   axisTo: number
   axisTotal: number
+  cost: Cost
 }
 
 const viewOf = (
@@ -193,6 +280,7 @@ const viewOf = (
     bg,
     axisTo,
     axisTotal: Math.max(1, axisTo - from),
+    cost: costOf(turn, turn.sub ?? []),
   }
 }
 
@@ -274,7 +362,7 @@ const svgCard = (v: View, view: ViewMode, expanded: boolean) => {
   // Header: a finished turn shows its total once; a live one leaves the time to the row above it.
   if (!v.isLive) {
     out.push(`<text x="${P}" y="${y + 22}" class="t n" font-size="24" font-weight="650">${esc(fmt(v.total))}</text>`)
-    out.push(`<text x="${P + fmt(v.total).length * 14.6 + 10}" y="${y + 22}" class="m" font-size="12.5">this turn</text>`)
+    out.push(`<text x="${P + fmt(v.total).length * 14.6 + 10}" y="${y + 22}" class="m" font-size="12.5">this turn<tspan class="t n" dx="10" font-weight="600">${esc(money(v.cost.total))}</tspan></text>`)
     y += 34
   }
 
@@ -513,10 +601,12 @@ const svgCard = (v: View, view: ViewMode, expanded: boolean) => {
   ].join('   ·   ')
   out.push(`<text x="${P}" y="${y + 18}" class="f n" font-size="10.5">${esc(foot)}</text>`)
   y += 24
+  out.push(`<text x="${P}" y="${y + 12}" class="m n" font-size="10.5">${esc(costLine(v.cost))}</text>`)
+  y += 18
 
   const H = y + P - 6
   const source = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${STYLE}<defs>${defs.join('')}</defs><rect width="${W}" height="${H}" fill="#151515"/><rect x=".5" y=".5" width="${W - 1}" height="${H - 1}" rx="14" fill="#1c1c1c" stroke="#2c2c2c"/>${out.join('')}</svg>`
-  const alt = `${fmt(v.total)}: Claude ${fmt(v.claudeMs)}, ${v.groups.map(g => `${g.kind.label} ${fmt(g.ms)}`).join(', ')}; untracked ${fmt(v.untrackedMs)}`
+  const alt = `${fmt(v.total)}, ${money(v.cost.total)}: Claude ${fmt(v.claudeMs)}, ${v.groups.map(g => `${g.kind.label} ${fmt(g.ms)}`).join(', ')}; untracked ${fmt(v.untrackedMs)}`
 
   return { source, alt, width: W, height: H }
 }
@@ -571,6 +661,7 @@ const textCard = (els: Els, v: View, view: ViewMode, columns: number) => {
     return (
       <Text>
         {!v.isLive && <Text bold>{fmt(v.total)}  </Text>}
+        <Text bold>{money(v.cost.total)}  </Text>
         {rows.map(r => (
           <Text>
             <Text color={r.color}>● </Text>
@@ -608,6 +699,7 @@ const textCard = (els: Els, v: View, view: ViewMode, columns: number) => {
       <Text dimColor>
         recorded {fmt(v.total)} · charted {fmt(v.drawnMs)} · untracked {fmt(v.untrackedMs)}
       </Text>
+      <Text dimColor>{costLine(v.cost)}</Text>
     </Box>
   )
 }
@@ -683,13 +775,14 @@ const nativeCard = (els: Els, v: View, expanded: boolean, doing: string) => {
       )}
     </Box>
   )
-  const lane = (label: string, color: string, ms: number, tracks: Seg[][], mark?: string) => (
+  const lane = (label: string, color: string, ms: number, tracks: Seg[][], mark?: string, usd?: number) => (
     <Box key={`lane:${label}`} flexDirection="row" width="100%" alignItems="center">
       <Box width="18%">
         <Text>
           <Text color={color}>● </Text>
           {label}
           {mark !== undefined && <Text color="#F43F5E"> {mark}</Text>}
+          {usd !== undefined && usd > 0 && <Text dimColor> {money(usd)}</Text>}
         </Text>
       </Box>
       <Box width="70%" flexDirection="column" backgroundColor="#232323">
@@ -702,14 +795,14 @@ const nativeCard = (els: Els, v: View, expanded: boolean, doing: string) => {
   )
   const waiting = '#3a3a3a'
   const claude = v.model.map(m => ({ ...m, color: m.phase === 'waiting' ? waiting : phaseOf(m.phase).color }))
-  const lanes = [lane('Claude', CLAUDE, v.claudeMs, [segsOf(claude, v.from, v.axisTotal, 'c')])]
+  const lanes = [lane('Claude', CLAUDE, v.claudeMs, [segsOf(claude, v.from, v.axisTotal, 'c')], undefined, v.cost.claude)]
   for (const g of v.order) {
     const bars = v.bars.filter(b => kindOf(b.tool) === g.kind)
     const tr = tracksOf(bars)
     const tracks = Array.from({ length: tr.count }, (_, i) =>
       segsOf(bars.filter(b => tr.at.get(b) === i).map(b => ({ ...b, color: g.kind.color })), v.from, v.axisTotal, `${g.kind.label}${i}`),
     )
-    lanes.push(lane(g.kind.label, g.kind.color, g.ms, tracks, bars.some(b => b.isRunning) ? '●' : undefined))
+    lanes.push(lane(g.kind.label, g.kind.color, g.ms, tracks, bars.some(b => b.isRunning) ? '●' : undefined, g.kind.label === 'Agents' ? v.cost.agents : undefined))
     if (g.kind.label === 'Agents' && v.sub.length > 0) {
       const agents = [...new Set(v.sub.map(x => x.agentId))]
       const subTracks = agents.map((id, i) =>
@@ -749,6 +842,9 @@ const nativeCard = (els: Els, v: View, expanded: boolean, doing: string) => {
           <Text color={v.isLive ? '#F43F5E' : CLAUDE}>{v.isLive ? '● ' : '◷ '}</Text>
           <Text bold>{v.isLive ? doing : fmt(v.total)}</Text>
           {!v.isLive && <Text dimColor> this turn</Text>}
+          {v.cost.total > 0 && <Text dimColor>  ·  </Text>}
+          {v.cost.total > 0 && <Text bold>{money(v.cost.total)}</Text>}
+          {v.cost.total > 0 && v.isLive && <Text dimColor> so far</Text>}
         </Text>
         <Text dimColor>{facts}</Text>
       </Box>
@@ -773,6 +869,12 @@ const nativeCard = (els: Els, v: View, expanded: boolean, doing: string) => {
             : `recorded ${fmt(v.total)} · charted ${fmt(v.drawnMs)} (${Math.round((v.drawnMs / v.total) * 100)}%) · untracked ${fmt(v.untrackedMs)}`}
         </Text>
       </Box>
+      {!v.isLive && v.cost.total > 0 && (
+        <Box key="cost" flexDirection="column">
+          <Text dimColor>{costLine(v.cost)}</Text>
+          {expanded && v.cost.reqs.length > 1 && <Text dimColor>priciest: {priciest(v.cost).join(' · ')}</Text>}
+        </Box>
+      )}
       {!v.isLive && v.turn.nudge !== undefined && (
         <Box key="nudge">
           <Text>
@@ -796,7 +898,6 @@ const median = (xs: readonly number[]) => {
   return s.length % 2 === 1 ? s[m] : (s[m - 1] + s[m]) / 2
 }
 
-const tokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`)
 
 const BUCKETS: { label: string; max: number }[] = [
   { label: '<50k', max: 50_000 },
@@ -817,7 +918,7 @@ const nudgeOf = (list: readonly StepStat[]) => {
   return `First-token wait is ${(recent / early).toFixed(1)}× what it was at the start (${fmt(early)} → ${fmt(recent)} at ${tokens(context)} tokens). /compact or a new session would reset it.`
 }
 
-const contextPane = (els: Els, list: readonly StepStat[], columns: number) => {
+const contextPane = (els: Els, list: readonly StepStat[], columns: number, sum: Totals) => {
   const { Box, Text } = els
   if (list.length === 0) return <Text dimColor>No model requests recorded yet in this session.</Text>
   const last = list[list.length - 1]
@@ -837,6 +938,13 @@ const contextPane = (els: Els, list: readonly StepStat[], columns: number) => {
   const peak = Math.max(1, ...series)
   const spark = series.map(v => '▁▂▃▄▅▆▇█'[Math.min(7, Math.floor((v / peak) * 7.999))]).join('')
   const missMs = misses.reduce((a, x) => a + Math.max(0, x.ttft - median(hits.map(h => h.ttft))), 0)
+  const missUsd = sumUsd(misses.map(x => ({ usd: x.missUsd })))
+  const turnUsd = (sum.turnUsd ?? []).slice(-Math.max(8, columns - 4))
+  const usdPeak = Math.max(0.0001, ...turnUsd)
+  const usdSpark = turnUsd.map(v => '▁▂▃▄▅▆▇█'[Math.min(7, Math.floor((v / usdPeak) * 7.999))]).join('')
+  const recent = turnUsd.slice(-5)
+  const early = turnUsd.slice(0, 5)
+  const avg = (xs: number[]) => (xs.length === 0 ? 0 : xs.reduce((a, x) => a + x, 0) / xs.length)
   const advice = nudgeOf(list)
 
   return (
@@ -860,15 +968,26 @@ const contextPane = (els: Els, list: readonly StepStat[], columns: number) => {
         <Text dimColor>Context over the session ({perTurn.size} turns)</Text>
         <Text color={CLAUDE}>{spark}</Text>
       </Box>
+      {turnUsd.length > 0 && (
+        <Box flexDirection="column">
+          <Text>
+            <Text bold>{money(sum.usd ?? 0)}</Text>
+            <Text dimColor> over {sum.turns} turns · last {money(turnUsd[turnUsd.length - 1] ?? 0)}</Text>
+            {turnUsd.length >= 10 && <Text dimColor> · recent turns avg {money(avg(recent))} vs {money(avg(early))} at the start</Text>}
+          </Text>
+          <Text dimColor>Cost per turn</Text>
+          <Text color="#34D399">{usdSpark}</Text>
+        </Box>
+      )}
       <Box flexDirection="column">
         <Text>
           <Text dimColor>Cache misses: </Text>
           <Text bold>{misses.length}</Text>
-          {misses.length > 0 && <Text dimColor> (about +{fmt(missMs)} of waiting)</Text>}
+          {misses.length > 0 && <Text dimColor> (about +{fmt(missMs)} of waiting, +{money(missUsd)} over cached)</Text>}
         </Text>
         {misses.slice(-5).map(x => (
           <Text key={`m:${x.at}`} dimColor>
-            {'  '}turn {x.turn} · re-read {tokens(x.fresh)} · waited {fmt(x.ttft)}
+            {'  '}turn {x.turn} · re-read {tokens(x.fresh)} · waited {fmt(x.ttft)}{x.missUsd !== undefined ? ` · +${money(x.missUsd)}` : ''}
           </Text>
         ))}
         {misses.length > 0 && <Text dimColor>  A miss follows a pause of about 5 minutes or a change early in the conversation; compacting does not prevent it.</Text>}
@@ -946,7 +1065,14 @@ const addTotals = (sum: Totals, t: TurnRecord): Totals => {
     for (const [name, n] of Object.entries(g.tools)) tools[name] = (tools[name] ?? 0) + n
     kinds[g.kind.label] = { ms: was.ms + g.ms, calls: was.calls + g.calls, tools }
   }
-  return { turns: sum.turns + 1, turnMs: sum.turnMs + v.total, claude, kinds }
+  return {
+    turns: sum.turns + 1,
+    turnMs: sum.turnMs + v.total,
+    usd: (sum.usd ?? 0) + v.cost.total,
+    turnUsd: [...(sum.turnUsd ?? []), v.cost.total].slice(-200),
+    claude,
+    kinds,
+  }
 }
 
 // Saves a finished turn's card copy and drops the oldest copies past the limit.
@@ -973,6 +1099,25 @@ function viewSetter($: EngineInterface) {
     await update($, mode, () => v)
     await $.store.set('mode', v)
   }
+}
+
+// The session's cost as /cost totals it, and whether the account is on a subscription.
+async function ledgerOf($: EngineInterface) {
+  try {
+    const u = await $.session.usage()
+    return { usd: u.cost?.usd, isSub: u.rateLimits.length > 0 }
+  } catch {
+    return { usd: undefined, isSub: false }
+  }
+}
+
+// What a request read first: the tool calls that ended since the previous request.
+const afterOf = (t: TurnRecord, at: number) => {
+  const since = (t.reqs ?? []).reduce((a, r) => Math.max(a, r.end), t.startedAt)
+  const counts: Record<string, number> = {}
+  for (const s of t.spans) if (s.end > since && s.end <= at) counts[shortName(s.tool)] = (counts[shortName(s.tool)] ?? 0) + 1
+  const out = Object.entries(counts).map(([n, c]) => (c > 1 ? `${n} ×${c}` : n)).join(', ')
+  return out === '' ? undefined : out
 }
 
 // Adds to the turn still running, if there is one.
@@ -1043,13 +1188,17 @@ export const register: Register = (on, options) => {
     ]
 
     return {
-      text: [`**Time spent:** ${fmt(sum.turnMs)} over ${sum.turns} turn${sum.turns === 1 ? '' : 's'}`, ...lines].join('\n'),
+      text: [
+        `**Time spent:** ${fmt(sum.turnMs)} over ${sum.turns} turn${sum.turns === 1 ? '' : 's'}${sum.usd !== undefined ? ` · **${money(sum.usd)}**` : ''}`,
+        ...lines,
+      ].join('\n'),
     }
   })
 
   on('turn.start', async ($, e, next) => {
     const now = await $.clock.now()
-    await update($, turns, list => [...pruned(list), { turnId: e.turnId, startedAt: now, spans: [], model: [], sub: [] }])
+    const { usd: usdStart } = await ledgerOf($)
+    await update($, turns, list => [...pruned(list), { turnId: e.turnId, startedAt: now, spans: [], model: [], sub: [], reqs: [], usdStart }])
     await update($, running, () => ({}))
     await update($, subRunning, () => ({}))
     await update($, step, () => null)
@@ -1069,7 +1218,20 @@ export const register: Register = (on, options) => {
       ticker = undefined
       const now = await $.clock.now()
       const nudge = nudgeOf(await read($, steps))
-      await update($, turns, list => list.map(t => (t.turnId === e.turnId ? { ...t, endedAt: now, nudge } : t)))
+      const ledger = await ledgerOf($)
+      await update($, turns, list =>
+        list.map(t =>
+          t.turnId === e.turnId
+            ? {
+                ...t,
+                endedAt: now,
+                nudge,
+                isSub: ledger.isSub,
+                usd: ledger.usd !== undefined && t.usdStart !== undefined ? Math.max(0, ledger.usd - t.usdStart) : undefined,
+              }
+            : t,
+        ),
+      )
       const finished = (await read($, turns)).find(t => t.turnId === e.turnId)
       if (finished !== undefined) await update($, totals, sum => addTotals(sum, finished))
       if (finished?.anchor !== undefined) {
@@ -1099,7 +1261,7 @@ export const register: Register = (on, options) => {
       await update($, subRunning, r => ({ ...r, [subId]: { agentId, tool: '@model', start: t0 } }))
     }
     const stream = next(e)
-    let ran: { usage?: { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } | null } | undefined
+    let ran: { usage?: Usage | null } | undefined
     try {
       for await (const chunk of stream) {
         const p = chunkPhase((chunk as { kind: string }).kind, phase)
@@ -1119,14 +1281,29 @@ export const register: Register = (on, options) => {
       if (isMain) {
         segs.push({ phase, start: since, end })
         await update($, step, () => null)
-        await onLiveTurn($, t => ({ ...t, model: [...(t.model ?? []), ...segs] }))
         const usage = ran?.usage
+        await onLiveTurn($, t => {
+          if (!usage) return { ...t, model: [...(t.model ?? []), ...segs] }
+          const req: Req = {
+            start: t0,
+            end,
+            model: usage.model ?? '',
+            usd: usdOf(usage),
+            input: usage.input_tokens ?? 0,
+            output: usage.output_tokens ?? 0,
+            cacheRead: usage.cache_read_input_tokens ?? 0,
+            cacheWrite: usage.cache_creation_input_tokens ?? 0,
+            after: afterOf(t, t0),
+          }
+          return { ...t, model: [...(t.model ?? []), ...segs], reqs: [...(t.reqs ?? []), req] }
+        })
         if (usage) {
           const fresh = (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
           const context = fresh + (usage.cache_read_input_tokens ?? 0)
           const ttft = segs[0]?.phase === 'waiting' ? segs[0].end - segs[0].start : 0
           const turn = (await read($, totals)).turns + 1
-          const stat: StepStat = { turn, at: t0, ttft, context, fresh, isMiss: context > 20_000 && fresh > context / 2 }
+          const isMiss = context > 20_000 && fresh > context / 2
+          const stat: StepStat = { turn, at: t0, ttft, context, fresh, isMiss, usd: usdOf(usage), missUsd: isMiss ? missUsdOf(usage) : undefined }
           await update($, steps, list => [...list, stat].slice(-500))
         }
       } else {
@@ -1135,7 +1312,7 @@ export const register: Register = (on, options) => {
           const { [subId]: _, ...rest } = r
           return rest
         })
-        await addSub($, { agentId, tool: '@model', start: t0, end })
+        await addSub($, { agentId, tool: '@model', start: t0, end, usd: ran?.usage ? usdOf(ran.usage) : undefined })
       }
     }
   })
@@ -1234,26 +1411,38 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: CONTEXT_PANE }, async ($, e) => {
     const els = $.ui.resolve(e) as unknown as Els
 
-    return contextPane(els, await read($, steps), Math.max(30, e.props.bodyColumns ?? 40))
+    return contextPane(els, await read($, steps), Math.max(30, e.props.bodyColumns ?? 40), await read($, totals))
   })
 
-  // Inline, under the turn's latest text block: live while the turn runs, the full card once it ends.
+  // The live card sits above the prompt: inline, under a text block the desktop app folds into
+  // the turn's tool group, it was hidden while the turn ran.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const list = await read($, turns)
+    const turn = list[list.length - 1]
+    const view = await read($, mode)
+    if (turn === undefined || turn.endedAt !== undefined || view === 'off') return next(e)
+    const els = $.ui.resolve(e) as unknown as Els
+    try {
+      const now = Math.max(await read($, tick), turn.startedAt)
+      const live = Object.values(await read($, running))
+      const phase = await read($, step)
+      const v = viewOf(turn, live, phase, now, Object.values(await read($, subRunning)))
+      const open = await read($, lanesOpen)
+      const doing = live.length > 0 ? `Running ${[...new Set(live.map(c => shortName(c.tool)))].join(', ')}` : phase !== null ? phaseOf(phase.phase).label : 'Working'
+      return cardOf(els, v, view, Math.max(40, e.props.bodyColumns), viewSetter($), { open, toggle: lanesToggle($, open) }, doing, contextOpener($))
+    } catch (err) {
+      return <els.Text color="#F43F5E">time-spent: {String(err)}</els.Text>
+    }
+  })
+
+  // Inline, under the turn's reply: the full card once the turn ends.
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     // A finished card reads its own member alone, so other turns' writes never redraw it.
     const key = keyOf(headOf(e.props.text), e.props.text.trim().length)
     const finished = await read($, atom({ ...doneFamily, id: key }, null))
-    let turn: TurnRecord | undefined = finished ?? undefined
-    if (turn === undefined) {
-      const lk = await read($, liveKey)
-      if (lk !== key) {
-        return next(e)
-      }
-      const list = await read($, turns)
-      turn = list[list.length - 1]
-      if (turn === undefined || turn.endedAt !== undefined) {
-        return next(e)
-      }
-    }
+    const turn: TurnRecord | undefined = finished ?? undefined
+    if (turn === undefined) return next(e)
     const view = await read($, mode)
     const els = $.ui.resolve(e) as unknown as Els
     const isLive = turn.endedAt === undefined

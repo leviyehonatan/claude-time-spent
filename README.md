@@ -2,19 +2,26 @@
 
 A Claude Code mod that shows where the time in each turn went: Claude's own work
 (thinking, writing, composing tool input, waiting for the first token) and every
-tool type (commands, agents, edits, reads and searches, web, browser, MCP), as a
-card inline in the chat.
+tool type (commands, agents, edits, reads and searches, web, browser, MCP), and what
+the turn cost, as a card inline in the chat.
 
-- **Live card** under Claude's latest message while a turn runs, updated every second
+- **Live card** above the prompt while a turn runs, updated every second (always in view,
+  even while the desktop app folds the turn's messages into its tool group)
 - **Finished card** under the final reply: a time strip of the turn in order, a legend
   with totals, and lanes per tool type (calls that ran together stack; parallel time is
   shaded; a subagent's own model and tool time shows on an "inside" lane)
 - **Background tasks** (commands and agents run in the background) on the card of the
   turn that launched them, from launch to their completion notice
 - A footer that compares recorded time with what the chart accounts for
+- **Cost** of each turn: the exact total from the session's cost ledger (what `/cost` reads),
+  split into Claude's own requests, agents and anything else, the cost on the Claude and
+  Agents lanes, and, with the lanes open, the priciest requests with the tool results each
+  one read first. Requests are priced from their token counts at list price, then scaled to
+  the ledger. On a subscription the figures are API list-price equivalents, not a bill.
 - **Context pane** (the **context ↗** button on a card, or `/time-spent context`): the context
   size now and over the session, the median first-token wait by context size (cached requests
-  only), and cache misses with how much they re-read
+  only), cache misses with how much they re-read and what they cost over a cached read, and the
+  session's cost with a cost-per-turn trend
 - A quiet **ⓘ** line on a turn's card when cached requests now wait at least twice as long as
   early in the session at 100k+ tokens, suggesting `/compact` or a new session
 - Views: `timeline`, `bars`, `compact`, `hide`; click **▾ ◷ Time spent** to fold the lanes.

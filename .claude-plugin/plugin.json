@@ -1,7 +1,7 @@
 {
   "name": "time-spent",
-  "version": "0.8.0",
-  "description": "A live card per turn: where the time went, across Claude and every tool type",
+  "version": "0.9.0",
+  "description": "A live card per turn: where the time and money went, across Claude and every tool type",
   "types": "./types/index.d.ts",
   "userConfig": {
     "cardsToKeep": {
