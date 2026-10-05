@@ -918,7 +918,8 @@ const nudgeOf = (list: readonly StepStat[]) => {
   return `First-token wait is ${(recent / early).toFixed(1)}× what it was at the start (${fmt(early)} → ${fmt(recent)} at ${tokens(context)} tokens). /compact or a new session would reset it.`
 }
 
-const contextPane = (els: Els, list: readonly StepStat[], columns: number, sum: Totals) => {
+// `spent` is the ledger since the first recorded turn (between-turn work included), `live` the running turn's so far.
+const contextPane = (els: Els, list: readonly StepStat[], columns: number, sum: Totals, spent?: number, live?: number) => {
   const { Box, Text } = els
   if (list.length === 0) return <Text dimColor>No model requests recorded yet in this session.</Text>
   const last = list[list.length - 1]
@@ -971,8 +972,9 @@ const contextPane = (els: Els, list: readonly StepStat[], columns: number, sum: 
       {turnUsd.length > 0 && (
         <Box flexDirection="column">
           <Text>
-            <Text bold>{money(sum.usd ?? 0)}</Text>
-            <Text dimColor> over {sum.turns} turns · last {money(turnUsd[turnUsd.length - 1] ?? 0)}</Text>
+            <Text bold>{money(spent ?? sum.usd ?? 0)}</Text>
+            <Text dimColor> over {sum.turns} turns{live !== undefined ? ` and this one (${money(live)} so far)` : ''} · last {money(turnUsd[turnUsd.length - 1] ?? 0)}</Text>
+            {spent !== undefined && spent - (sum.usd ?? 0) - (live ?? 0) >= 0.01 && <Text dimColor> · {money(spent - (sum.usd ?? 0) - (live ?? 0))} between turns</Text>}
             {turnUsd.length >= 10 && <Text dimColor> · recent turns avg {money(avg(recent))} vs {money(avg(early))} at the start</Text>}
           </Text>
           <Text dimColor>Cost per turn</Text>
@@ -1068,6 +1070,7 @@ const addTotals = (sum: Totals, t: TurnRecord): Totals => {
   return {
     turns: sum.turns + 1,
     turnMs: sum.turnMs + v.total,
+    usdBase: sum.usdBase ?? t.usdStart,
     usd: (sum.usd ?? 0) + v.cost.total,
     turnUsd: [...(sum.turnUsd ?? []), v.cost.total].slice(-200),
     claude,
@@ -1113,7 +1116,8 @@ async function ledgerOf($: EngineInterface) {
 
 // What a request read first: the tool calls that ended since the previous request.
 const afterOf = (t: TurnRecord, at: number) => {
-  const since = (t.reqs ?? []).reduce((a, r) => Math.max(a, r.end), t.startedAt)
+  // From the previous request's start: the tools it called can finish while it is still streaming.
+  const since = (t.reqs ?? []).reduce((a, r) => Math.max(a, r.start), t.startedAt)
   const counts: Record<string, number> = {}
   for (const s of t.spans) if (s.end > since && s.end <= at) counts[shortName(s.tool)] = (counts[shortName(s.tool)] ?? 0) + 1
   const out = Object.entries(counts).map(([n, c]) => (c > 1 ? `${n} ×${c}` : n)).join(', ')
@@ -1131,6 +1135,26 @@ function onLiveTurn($: EngineInterface, fn: (t: TurnRecord) => TurnRecord) {
 
 const chunkPhase = (kind: string, was: Phase): Phase =>
   kind === 'thinking' ? 'thinking' : kind === 'text' ? 'writing' : kind === 'tool' || kind === 'input' ? 'composing' : was
+
+// The live card while a turn runs, or null when there is none to draw.
+async function liveCardOf($: EngineInterface, e: any, columns: number) {
+  const list = await read($, turns)
+  const turn = list[list.length - 1]
+  const view = await read($, mode)
+  if (turn === undefined || turn.endedAt !== undefined || view === 'off') return null
+  const els = $.ui.resolve(e) as unknown as Els
+  try {
+    const now = Math.max(await read($, tick), turn.startedAt)
+    const live = Object.values(await read($, running))
+    const phase = await read($, step)
+    const v = viewOf(turn, live, phase, now, Object.values(await read($, subRunning)))
+    const open = await read($, lanesOpen)
+    const doing = live.length > 0 ? `Running ${[...new Set(live.map(c => shortName(c.tool)))].join(', ')}` : phase !== null ? phaseOf(phase.phase).label : 'Working'
+    return cardOf(els, v, view, Math.max(40, columns), viewSetter($), { open, toggle: lanesToggle($, open) }, doing, contextOpener($))
+  } catch (err) {
+    return <els.Text color="#F43F5E">time-spent: {String(err)}</els.Text>
+  }
+}
 
 export const register: Register = (on, options) => {
   const setting = String((options as Record<string, unknown>).cardsToKeep ?? '100')
@@ -1180,6 +1204,12 @@ export const register: Register = (on, options) => {
     const sum = await read($, totals)
     if (sum.turns === 0) return { text: 'Nothing recorded yet in this chat.' }
     const claudeMs = Object.values(sum.claude).reduce((x, y) => x + y, 0)
+    // The ledger is the whole session; the turns' cards miss what ran between turns (a background
+    // agent finishing while idle, side calls), so that shows as its own figure.
+    const { usd: ledgerUsd } = await ledgerOf($)
+    const between = ledgerUsd !== undefined ? ledgerUsd - (sum.usdBase ?? 0) - (sum.usd ?? 0) : 0
+    const total = ledgerUsd !== undefined ? ledgerUsd - (sum.usdBase ?? 0) : sum.usd
+    const usdLine = total === undefined ? '' : ` · **${money(total)}**${between >= 0.01 ? ` (${money(between)} of it between turns)` : ''}`
     const lines = [
       `- **Claude**: ${fmt(claudeMs)} (${PHASES.map(p => `${p.label.toLowerCase()} ${fmt(sum.claude[p.phase] ?? 0)}`).join(', ')})`,
       ...Object.entries(sum.kinds)
@@ -1189,7 +1219,7 @@ export const register: Register = (on, options) => {
 
     return {
       text: [
-        `**Time spent:** ${fmt(sum.turnMs)} over ${sum.turns} turn${sum.turns === 1 ? '' : 's'}${sum.usd !== undefined ? ` · **${money(sum.usd)}**` : ''}`,
+        `**Time spent:** ${fmt(sum.turnMs)} over ${sum.turns} turn${sum.turns === 1 ? '' : 's'}${usdLine}`,
         ...lines,
       ].join('\n'),
     }
@@ -1411,29 +1441,37 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: CONTEXT_PANE }, async ($, e) => {
     const els = $.ui.resolve(e) as unknown as Els
 
-    return contextPane(els, await read($, steps), Math.max(30, e.props.bodyColumns ?? 40), await read($, totals))
-  })
-
-  // The live card sits above the prompt: inline, under a text block the desktop app folds into
-  // the turn's tool group, it was hidden while the turn ran.
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey) return next(e)
+    const sum = await read($, totals)
     const list = await read($, turns)
     const turn = list[list.length - 1]
-    const view = await read($, mode)
-    if (turn === undefined || turn.endedAt !== undefined || view === 'off') return next(e)
-    const els = $.ui.resolve(e) as unknown as Els
-    try {
-      const now = Math.max(await read($, tick), turn.startedAt)
-      const live = Object.values(await read($, running))
-      const phase = await read($, step)
-      const v = viewOf(turn, live, phase, now, Object.values(await read($, subRunning)))
-      const open = await read($, lanesOpen)
-      const doing = live.length > 0 ? `Running ${[...new Set(live.map(c => shortName(c.tool)))].join(', ')}` : phase !== null ? phaseOf(phase.phase).label : 'Working'
-      return cardOf(els, v, view, Math.max(40, e.props.bodyColumns), viewSetter($), { open, toggle: lanesToggle($, open) }, doing, contextOpener($))
-    } catch (err) {
-      return <els.Text color="#F43F5E">time-spent: {String(err)}</els.Text>
-    }
+    const { usd: ledgerUsd } = await ledgerOf($)
+    const base = sum.usdBase ?? turn?.usdStart
+    const spent = ledgerUsd !== undefined && base !== undefined ? ledgerUsd - base : undefined
+    const live = turn !== undefined && turn.endedAt === undefined && ledgerUsd !== undefined && turn.usdStart !== undefined ? ledgerUsd - turn.usdStart : undefined
+
+    return contextPane(els, await read($, steps), Math.max(30, e.props.bodyColumns ?? 40), sum, spent, live)
+  })
+
+  // The live card draws under the running turn's spinner row: next to the work, and never folded
+  // into the turn's tool group the way the latest text block is.
+  on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
+    const card = await liveCardOf($, e, (e.viewport?.columns ?? 80) - 4)
+    const row = await next(e)
+    if (card === null) return row
+    const { Box } = $.ui.resolve(e) as unknown as Els
+    return (
+      <Box flexDirection="column">
+        {row}
+        {card}
+      </Box>
+    )
+  })
+
+  // Surfaces that draw no spinner row keep the live card above the prompt.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey || e.surface === 'terminal' || e.surface === 'desktop') return next(e)
+    const card = await liveCardOf($, e, e.props.bodyColumns)
+    return card ?? next(e)
   })
 
   // Inline, under the turn's reply: the full card once the turn ends.

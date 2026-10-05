@@ -5,8 +5,9 @@ A Claude Code mod that shows where the time in each turn went: Claude's own work
 tool type (commands, agents, edits, reads and searches, web, browser, MCP), and what
 the turn cost, as a card inline in the chat.
 
-- **Live card** above the prompt while a turn runs, updated every second (always in view,
-  even while the desktop app folds the turn's messages into its tool group)
+- **Live card** under the running turn's spinner, updated every second (always in view,
+  even while the desktop app folds the turn's messages into its tool group; above the prompt
+  on surfaces with no spinner row)
 - **Finished card** under the final reply: a time strip of the turn in order, a legend
   with totals, and lanes per tool type (calls that ran together stack; parallel time is
   shaded; a subagent's own model and tool time shows on an "inside" lane)
@@ -21,7 +22,7 @@ the turn cost, as a card inline in the chat.
 - **Context pane** (the **context ↗** button on a card, or `/time-spent context`): the context
   size now and over the session, the median first-token wait by context size (cached requests
   only), cache misses with how much they re-read and what they cost over a cached read, and the
-  session's cost with a cost-per-turn trend
+  session's cost (from the ledger, so cost between turns counts too) with a cost-per-turn trend
 - A quiet **ⓘ** line on a turn's card when cached requests now wait at least twice as long as
   early in the session at 100k+ tokens, suggesting `/compact` or a new session
 - Views: `timeline`, `bars`, `compact`, `hide`; click **▾ ◷ Time spent** to fold the lanes.

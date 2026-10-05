@@ -82,6 +82,8 @@ export type Totals = {
   turnMs: number
   /** Dollars over the finished turns (ledger growth). */
   usd?: number
+  /** The ledger when the first recorded turn started: what the session cost before this mod saw it. */
+  usdBase?: number
   /** Turn costs in order, the last 200, for the Context pane. */
   turnUsd?: number[]
   /** Claude's time per phase. */

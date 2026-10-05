@@ -46,11 +46,18 @@ test("a turn's total is the ledger's growth when there is a ledger", async ($: a
   expect((await command($)).text).toContain('$0.37')
 })
 
-test('the live card draws above the prompt while the turn runs', async ($: any, on: any) => {
+test('the live card draws under the spinner row while the turn runs', async ($: any, on: any) => {
   engine(on)
+  // The engine's own spinner row, which the card draws under.
+  on('ui.render', { component: 'Spinner' }, async ($: any, e: any) => {
+    const { Text } = $.ui.resolve(e)
+    return h(Text, null, e.props.word)
+  })
   await turn($)
   for (const surface of ['terminal', 'desktop'] as const) {
-    const m = await $.ui.mount({ plugin: 'time-spent', surface, component: 'AbovePrompt', props: { hasSurvey: false, isWorking: true, maxRows: 40, bodyColumns: 100 } })
-    expect(JSON.stringify(await m.drawn())).toContain(PRICE)
+    const m = await $.ui.mount({ plugin: 'time-spent', surface, component: 'Spinner', props: { word: 'Working', message: null, suffix: '…', mode: 'tool-use' } })
+    const drawn = JSON.stringify(await m.drawn())
+    expect(drawn).toContain(PRICE)
+    expect(drawn).toContain('Working')
   }
 })
